@@ -1,11 +1,14 @@
+<script context="module" lang="ts">
+	/** Shared 1×1 transparent drag preview; avoids one Image per sidebar row */
+	const invisibleDragImage = new Image();
+	invisibleDragImage.src =
+		'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+</script>
+
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
 	import { goto, invalidate, invalidateAll } from '$app/navigation';
-	import { onMount, getContext, createEventDispatcher, tick, onDestroy } from 'svelte';
-	const i18n = getContext('i18n');
-
-	const dispatch = createEventDispatcher();
-
+	import { onMount, getContext, createEventDispatcher, tick } from 'svelte';
 	import {
 		archiveChatById,
 		cloneChatById,
@@ -28,7 +31,8 @@
 		currentChatPage,
 		tags,
 		selectedFolder,
-		activeChatIds
+		activeChatIds,
+		user
 	} from '$lib/stores';
 
 	import ChatMenu from './ChatMenu.svelte';
@@ -44,15 +48,26 @@
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { generateTitle } from '$lib/apis';
+	import { createMessagesList } from '$lib/utils';
+
+	const i18n = getContext('i18n');
+
+	const dispatch = createEventDispatcher();
 
 	export let className = '';
 
 	export let id;
 	export let title;
 	export let createdAt: number | null = null;
+	export let updatedAt: number | null = null;
+	export let lastReadAt: number | null = null;
 
 	export let selected = false;
 	export let shiftKey = false;
+	export let readonly = false;
+
+	export let ownerName: string | null = null;
+	export let ownerUserId: string | null = null;
 
 	export let onDragEnd = () => {};
 
@@ -78,6 +93,22 @@
 	let chat = null;
 
 	let mouseOver = false;
+
+	// Local state: tracks the last updatedAt seen while the user was viewing
+	// this chat.  Survives prop refreshes from sidebar data re-fetches that
+	// would overwrite the `lastReadAt` prop with a stale server value.
+	let viewedAt: number | null = null;
+
+	$: if (id === $chatId) {
+		viewedAt = updatedAt ?? Date.now() / 1000;
+	}
+
+	$: effectiveReadAt = Math.max(lastReadAt ?? 0, viewedAt ?? 0) || null;
+
+	$: unread =
+		id !== $chatId &&
+		!$activeChatIds.has(id) &&
+		(effectiveReadAt === null || (updatedAt !== null && updatedAt > effectiveReadAt));
 
 	const loadChat = async () => {
 		if (!chat) {
@@ -113,6 +144,11 @@
 	};
 
 	const cloneChatHandler = async (id) => {
+		if (!($user?.role === 'admin' || ($user?.permissions?.chat?.import ?? true))) {
+			toast.error($i18n.t('Access prohibited'));
+			return;
+		}
+
 		const res = await cloneChatById(
 			localStorage.token,
 			id,
@@ -133,7 +169,12 @@
 		}
 	};
 
+	let deleting = false;
+
 	const deleteChatHandler = async (id) => {
+		if (deleting) return;
+		deleting = true;
+
 		const res = await deleteChatById(localStorage.token, id).catch((error) => {
 			toast.error(`${error}`);
 			return null;
@@ -150,9 +191,16 @@
 
 			dispatch('change');
 		}
+
+		deleting = false;
 	};
 
+	let archiving = false;
+
 	const archiveChatHandler = async (id) => {
+		if (archiving) return;
+		archiving = true;
+
 		try {
 			await archiveChatById(localStorage.token, id);
 
@@ -166,6 +214,8 @@
 		} catch (error) {
 			console.error('Error archiving chat:', error);
 			toast.error($i18n.t('Failed to archive chat.'));
+		} finally {
+			archiving = false;
 		}
 	};
 
@@ -203,14 +253,10 @@
 	let x = 0;
 	let y = 0;
 
-	const dragImage = new Image();
-	dragImage.src =
-		'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
-
 	const onDragStart = (event) => {
 		event.stopPropagation();
 
-		event.dataTransfer.setDragImage(dragImage, 0, 0);
+		event.dataTransfer.setDragImage(invisibleDragImage, 0, 0);
 
 		// Set the data to be transferred
 		event.dataTransfer.setData(
@@ -220,6 +266,7 @@
 				id: id
 			})
 		);
+		event.dataTransfer.setData('application/x-open-webui-drag', '');
 
 		dragged = true;
 		itemElement.style.opacity = '0.5'; // Optional: Visual cue to show it's being dragged
@@ -255,26 +302,20 @@
 	};
 
 	onMount(() => {
-		if (itemElement) {
-			document.addEventListener('click', onClickOutside, true);
+		const el = itemElement;
+		if (!el) return;
 
-			// Event listener for when dragging starts
-			itemElement.addEventListener('dragstart', onDragStart);
-			// Event listener for when dragging occurs (optional)
-			itemElement.addEventListener('drag', onDrag);
-			// Event listener for when dragging ends
-			itemElement.addEventListener('dragend', onDragEndHandler);
-		}
-	});
+		document.addEventListener('click', onClickOutside, true);
+		el.addEventListener('dragstart', onDragStart);
+		el.addEventListener('drag', onDrag);
+		el.addEventListener('dragend', onDragEndHandler);
 
-	onDestroy(() => {
-		if (itemElement) {
+		return () => {
 			document.removeEventListener('click', onClickOutside, true);
-
-			itemElement.removeEventListener('dragstart', onDragStart);
-			itemElement.removeEventListener('drag', onDrag);
-			itemElement.removeEventListener('dragend', onDragEndHandler);
-		}
+			el.removeEventListener('dragstart', onDragStart);
+			el.removeEventListener('drag', onDrag);
+			el.removeEventListener('dragend', onDragEndHandler);
+		};
 	});
 
 	let showDeleteConfirm = false;
@@ -310,18 +351,56 @@
 
 	const generateTitleHandler = async () => {
 		generating = true;
-		if (!chat) {
-			chat = await getChatById(localStorage.token, id);
-		}
+		chat = await getChatById(localStorage.token, id);
 
-		const messages = (chat.chat?.messages ?? []).map((message) => {
-			return {
+		const chatContent = chat.chat;
+
+		// Build the active branch message list from the history tree.
+		// Fallback to the legacy flat messages array for older chats
+		// that haven't been migrated to the tree structure yet.
+		const history = chatContent?.history;
+		let messages = [];
+		if (history?.messages && history?.currentId) {
+			messages = createMessagesList(history, history.currentId).map((message) => ({
 				role: message.role,
 				content: message.content
-			};
-		});
+			}));
+		} else {
+			messages = (chatContent?.messages ?? []).map((message) => ({
+				role: message.role,
+				content: message.content
+			}));
+		}
 
-		const model = chat.chat.models.at(0) ?? chat.models.at(0) ?? '';
+		// Resolve the model from the most recent assistant message in the
+		// active branch. This avoids using the stale top-level `models`
+		// array which may reference a model from an older edit.
+		let model = '';
+
+		// For the active chat, prefer the live dropdown selection.
+		if (id === $chatId) {
+			try {
+				model = JSON.parse(sessionStorage.selectedModels || '[]').find((m) => m) ?? '';
+			} catch {}
+		}
+
+		if (!model && history?.messages && history?.currentId) {
+			let currentId = history.currentId;
+			while (currentId) {
+				const msg = history.messages[currentId];
+				if (!msg) break;
+				if (msg.role === 'assistant' && msg.model) {
+					model = msg.model;
+					break;
+				}
+				currentId = msg.parentId;
+			}
+		}
+
+		// Fallback to top-level models if no model was found in the history
+		if (!model) {
+			model = chatContent?.models?.at(0) ?? '';
+		}
 
 		chatTitle = '';
 
@@ -377,7 +456,7 @@
 	id="sidebar-chat-group"
 	bind:this={itemElement}
 	class=" w-full {className} relative group"
-	draggable={!confirmEdit}
+	draggable={!confirmEdit && !readonly}
 >
 	{#if confirmEdit}
 		<div
@@ -435,8 +514,13 @@
 				if ($mobile) {
 					showSidebar.set(false);
 				}
+
+				// Optimistically mark as read in UI when clicked
+				unread = false;
+				lastReadAt = Date.now() / 1000;
 			}}
 			on:dblclick={async (e) => {
+				if (readonly) return;
 				e.preventDefault();
 				e.stopPropagation();
 
@@ -452,6 +536,16 @@
 			on:focus={(e) => {}}
 			draggable="false"
 		>
+			{#if ownerUserId}
+				<Tooltip content={ownerName || 'Unknown'}>
+					<img
+						src="/api/v1/users/{ownerUserId}/profile/image"
+						alt=""
+						class="size-3.5 rounded-full shrink-0 object-cover mr-1.5"
+					/>
+				</Tooltip>
+			{/if}
+
 			<!-- Loading spinner for active chat (left side) -->
 			{#if $activeChatIds.has(id)}
 				<div class="shrink-0 self-center pr-2">
@@ -460,7 +554,17 @@
 			{/if}
 
 			<div class="flex self-center flex-1 w-full min-w-0">
-				<div dir="auto" class="text-left self-center overflow-hidden w-full h-[20px] truncate">
+				{#if unread}
+					<div class="shrink-0 self-center pr-2.5 flex transition-opacity duration-300">
+						<div class="size-1.5 bg-sky-500 rounded-full" />
+					</div>
+				{/if}
+				<div
+					dir="auto"
+					class="text-left self-center overflow-hidden w-full h-[20px] truncate {unread
+						? 'font-medium text-gray-900 dark:text-gray-100'
+						: ''}"
+				>
 					{title}
 				</div>
 			</div>
@@ -475,136 +579,140 @@
 	{/if}
 
 	<!-- svelte-ignore a11y-no-static-element-interactions -->
-	<div
-		id="sidebar-chat-item-menu"
-		class="
+	{#if !readonly}
+		<div
+			id="sidebar-chat-item-menu"
+			class="
         {id === $chatId || confirmEdit
-			? 'from-gray-100 dark:from-gray-900 selected'
-			: selected
-				? 'from-gray-100 dark:from-gray-950 selected'
-				: 'invisible group-hover:visible from-gray-100 dark:from-gray-950'}
+				? 'from-gray-100 dark:from-gray-900 selected'
+				: selected
+					? 'from-gray-100 dark:from-gray-950 selected'
+					: 'invisible group-hover:visible from-gray-100 dark:from-gray-950'}
             absolute {className === 'pr-2'
-			? 'right-[8px]'
-			: 'right-1'} top-[4px] py-1 pr-0.5 mr-1.5 pl-5 bg-linear-to-l from-80%
+				? 'right-[8px]'
+				: 'right-1'} top-[4px] py-1 pr-0.5 mr-1.5 pl-5 bg-linear-to-l from-80%
 
               to-transparent"
-		on:mouseenter={(e) => {
-			mouseOver = true;
-		}}
-		on:mouseleave={(e) => {
-			mouseOver = false;
-		}}
-	>
-		{#if confirmEdit}
-			<div
-				class="flex self-center items-center space-x-1.5 z-10 translate-y-[0.5px] -translate-x-[0.5px]"
-			>
-				<Tooltip content={$i18n.t('Generate')}>
-					<button
-						class=" self-center dark:hover:text-white transition disabled:cursor-not-allowed"
-						id="generate-title-button"
-						disabled={generating}
-						on:click={() => {
-							generateTitleHandler();
+			on:mouseenter={(e) => {
+				mouseOver = true;
+			}}
+			on:mouseleave={(e) => {
+				mouseOver = false;
+			}}
+		>
+			{#if confirmEdit}
+				<div
+					class="flex self-center items-center space-x-1.5 z-10 translate-y-[0.5px] -translate-x-[0.5px]"
+				>
+					<Tooltip content={$i18n.t('Generate')}>
+						<button
+							class=" self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+							id="generate-title-button"
+							disabled={generating}
+							on:click={() => {
+								generateTitleHandler();
+							}}
+						>
+							<Sparkles strokeWidth="2" />
+						</button>
+					</Tooltip>
+				</div>
+			{:else if shiftKey && mouseOver}
+				<div class=" flex items-center self-center space-x-1.5">
+					<Tooltip content={$i18n.t('Archive')} className="flex items-center">
+						<button
+							class=" self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+							disabled={archiving}
+							on:click={() => {
+								archiveChatHandler(id);
+							}}
+							type="button"
+						>
+							<ArchiveBox className="size-4  translate-y-[0.5px]" strokeWidth="2" />
+						</button>
+					</Tooltip>
+
+					<Tooltip content={$i18n.t('Delete')}>
+						<button
+							class=" self-center dark:hover:text-white transition disabled:cursor-not-allowed"
+							disabled={deleting}
+							on:click={() => {
+								deleteChatHandler(id);
+							}}
+							type="button"
+						>
+							<GarbageBin strokeWidth="2" />
+						</button>
+					</Tooltip>
+				</div>
+			{:else}
+				<div class="flex self-center z-10 items-end">
+					<ChatMenu
+						chatId={id}
+						cloneChatHandler={() => {
+							cloneChatHandler(id);
 						}}
-					>
-						<Sparkles strokeWidth="2" />
-					</button>
-				</Tooltip>
-			</div>
-		{:else if shiftKey && mouseOver}
-			<div class=" flex items-center self-center space-x-1.5">
-				<Tooltip content={$i18n.t('Archive')} className="flex items-center">
-					<button
-						class=" self-center dark:hover:text-white transition"
-						on:click={() => {
+						shareHandler={() => {
+							showShareChatModal = true;
+						}}
+						{moveChatHandler}
+						archiveChatHandler={() => {
 							archiveChatHandler(id);
 						}}
-						type="button"
-					>
-						<ArchiveBox className="size-4  translate-y-[0.5px]" strokeWidth="2" />
-					</button>
-				</Tooltip>
-
-				<Tooltip content={$i18n.t('Delete')}>
-					<button
-						class=" self-center dark:hover:text-white transition"
-						on:click={() => {
-							deleteChatHandler(id);
-						}}
-						type="button"
-					>
-						<GarbageBin strokeWidth="2" />
-					</button>
-				</Tooltip>
-			</div>
-		{:else}
-			<div class="flex self-center z-10 items-end">
-				<ChatMenu
-					chatId={id}
-					cloneChatHandler={() => {
-						cloneChatHandler(id);
-					}}
-					shareHandler={() => {
-						showShareChatModal = true;
-					}}
-					{moveChatHandler}
-					archiveChatHandler={() => {
-						archiveChatHandler(id);
-					}}
-					{renameHandler}
-					deleteHandler={() => {
-						showDeleteConfirm = true;
-					}}
-					onClose={() => {
-						dispatch('unselect');
-					}}
-					onPinChange={async () => {
-						dispatch('change');
-					}}
-				>
-					<button
-						aria-label="Chat Menu"
-						class=" self-center dark:hover:text-white transition m-0"
-						on:click={() => {
-							dispatch('select');
-						}}
-					>
-						<svg
-							xmlns="http://www.w3.org/2000/svg"
-							viewBox="0 0 16 16"
-							fill="currentColor"
-							class="w-4 h-4"
-						>
-							<path
-								d="M2 8a1.5 1.5 0 1 1 3 0 1.5 1.5 0 0 1-3 0ZM6.5 8a1.5 1.5 0 1 1 3 0 1.5 1.5 0 0 1-3 0ZM12.5 6.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"
-							/>
-						</svg>
-					</button>
-				</ChatMenu>
-
-				{#if id === $chatId}
-					<!-- Shortcut support using "delete-chat-button" id -->
-					<button
-						id="delete-chat-button"
-						class="hidden"
-						on:click={() => {
+						{renameHandler}
+						deleteHandler={() => {
 							showDeleteConfirm = true;
 						}}
+						onClose={() => {
+							dispatch('unselect');
+						}}
+						onPinChange={async () => {
+							dispatch('change');
+						}}
 					>
-						<svg
-							xmlns="http://www.w3.org/2000/svg"
-							viewBox="0 0 16 16"
-							fill="currentColor"
-							class="w-4 h-4"
+						<button
+							aria-label="Chat Menu"
+							class=" self-center dark:hover:text-white transition m-0"
+							on:click={() => {
+								dispatch('select');
+							}}
 						>
-							<path
-								d="M2 8a1.5 1.5 0 1 1 3 0 1.5 1.5 0 0 1-3 0ZM6.5 8a1.5 1.5 0 1 1 3 0 1.5 1.5 0 0 1-3 0ZM12.5 6.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"
-							/>
-						</svg>
-					</button>
-				{/if}
-			</div>
-		{/if}
-	</div>
+							<svg
+								xmlns="http://www.w3.org/2000/svg"
+								viewBox="0 0 16 16"
+								fill="currentColor"
+								class="w-4 h-4"
+							>
+								<path
+									d="M2 8a1.5 1.5 0 1 1 3 0 1.5 1.5 0 0 1-3 0ZM6.5 8a1.5 1.5 0 1 1 3 0 1.5 1.5 0 0 1-3 0ZM12.5 6.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"
+								/>
+							</svg>
+						</button>
+					</ChatMenu>
+
+					{#if id === $chatId}
+						<!-- Shortcut support using "delete-chat-button" id -->
+						<button
+							id="delete-chat-button"
+							class="hidden"
+							on:click={() => {
+								showDeleteConfirm = true;
+							}}
+						>
+							<svg
+								xmlns="http://www.w3.org/2000/svg"
+								viewBox="0 0 16 16"
+								fill="currentColor"
+								class="w-4 h-4"
+							>
+								<path
+									d="M2 8a1.5 1.5 0 1 1 3 0 1.5 1.5 0 0 1-3 0ZM6.5 8a1.5 1.5 0 1 1 3 0 1.5 1.5 0 0 1-3 0ZM12.5 6.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z"
+								/>
+							</svg>
+						</button>
+					{/if}
+				</div>
+			{/if}
+		</div>
+	{/if}
 </div>
